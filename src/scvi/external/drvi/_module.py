@@ -120,6 +120,10 @@ class DRVIModule(VAE):
         after an underscore (e.g. ``"ReLU"``, ``"GELU"``, ``"ELU_0.5"``, ``"LeakyReLU_0.2"``), an
         ``nn.Module`` subclass, or an instance. Applied only to the latent encoder, not the
         library encoder.
+    residual
+        Add residual skip connections around the same-width hidden blocks of the encoder body and
+        the decoder split body (the :class:`~scvi.nn.FCLayers` ``residual`` flag). Requires
+        ``n_layers >= 2`` to have any effect.
     extra_encoder_kwargs
         Extra keyword arguments for the encoder :class:`~scvi.nn.FCLayers`.
     extra_decoder_kwargs
@@ -155,6 +159,7 @@ class DRVIModule(VAE):
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         activation_fn: str | type[nn.Module] = "elu",
         mean_activation: str | type[nn.Module] | nn.Module | None = None,
+        residual: bool = False,
         extra_encoder_kwargs: dict | None = None,
         extra_decoder_kwargs: dict | None = None,
         **kwargs,
@@ -163,6 +168,10 @@ class DRVIModule(VAE):
         activation = _resolve_activation(activation_fn)
         extra_encoder_kwargs = {"activation_fn": activation, **(extra_encoder_kwargs or {})}
         decoder_extra_kwargs = {"activation_fn": activation, **(extra_decoder_kwargs or {})}
+        if residual:
+            # residual skips around same-width hidden blocks of the encoder and decoder bodies
+            extra_encoder_kwargs["residual"] = True
+            decoder_extra_kwargs["residual"] = True
 
         super().__init__(
             n_input,
@@ -191,6 +200,7 @@ class DRVIModule(VAE):
         self.n_split_latent = n_split_latent
         self.split_method = split_method
         self.split_aggregation = split_aggregation
+        self.residual = residual
         # analysis flags read by the generative / interpretability mixins
         self.inspect_mode = False
         self.fully_deterministic = False
