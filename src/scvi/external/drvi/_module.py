@@ -7,15 +7,10 @@ from torch import nn
 from torch.nn.functional import linear, one_hot
 
 from scvi import REGISTRY_KEYS
-from scvi.distributions import (
-    NegativeBinomial,
-    Normal,
-    Poisson,
-    ZeroInflatedNegativeBinomial,
-)
+from scvi.distributions import Normal
 from scvi.external.drvi._base_components import DecoderDRVI
 from scvi.external.drvi._constants import DRVI_MODULE_KEYS
-from scvi.external.drvi._distributions import LogNegativeBinomial
+from scvi.external.drvi._distributions import build_gene_likelihood
 from scvi.module import VAE
 from scvi.module._constants import MODULE_KEYS
 from scvi.module.base import auto_move_data
@@ -133,6 +128,8 @@ class DRVIModule(VAE):
         Additional keyword arguments for :class:`~scvi.module.VAE`.
     """
 
+    _decoder_cls = DecoderDRVI
+
     def __init__(
         self,
         n_input: int,
@@ -211,7 +208,7 @@ class DRVIModule(VAE):
         use_layer_norm_decoder = use_layer_norm in ("decoder", "both")
 
         # replace the inherited decoder with drvi additive decoder
-        self.decoder = DecoderDRVI(
+        self.decoder = self._decoder_cls(
             n_latent,
             n_input,
             n_split=self.n_split_latent,
@@ -240,6 +237,54 @@ class DRVIModule(VAE):
             outputs[MODULE_KEYS.Z_KEY] = self.z_encoder.z_transformation(qz.loc)
         return outputs
 
+    def _build_gene_likelihood(
+        self,
+        gene_likelihood: str,
+        px_scale_logit: torch.Tensor,
+        px_r_logit: torch.Tensor,
+        px_dropout_logit: torch.Tensor | None = None,
+        size_factor: torch.Tensor | None = None,
+    ) -> Distribution:
+        return build_gene_likelihood(
+            gene_likelihood, px_scale_logit, px_r_logit, px_dropout_logit, size_factor
+        )
+
+    def _prepare_decoder_covariate_inputs(
+        self,
+        batch_index: torch.Tensor,
+        cont_covs: torch.Tensor | None,
+        cat_covs: torch.Tensor | None,
+        transform_batch: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...]]:
+        categorical_input = torch.split(cat_covs, 1, dim=1) if cat_covs is not None else ()
+        if transform_batch is not None:
+            batch_index = torch.ones_like(batch_index) * transform_batch
+        if self.batch_representation == "embedding":
+            batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
+            decoder_cont = (
+                batch_rep if cont_covs is None else torch.cat([cont_covs, batch_rep], dim=-1)
+            )
+            decoder_cats = categorical_input
+        else:
+            decoder_cont = cont_covs
+            decoder_cats = (batch_index, *categorical_input)
+        return batch_index, decoder_cont, decoder_cats
+
+    def _compute_px_r_logit(
+        self,
+        px_r_logit: torch.Tensor,
+        y: torch.Tensor | None,
+        batch_index: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.dispersion == "gene-label":
+            px_r_logit = linear(one_hot(y.squeeze(-1), self.n_labels).float(), self.px_r)
+        elif self.dispersion == "gene-batch":
+            px_r_logit = linear(one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
+        elif self.dispersion == "gene":
+            px_r_logit = self.px_r
+        return px_r_logit
+
     @auto_move_data
     def generative(
         self,
@@ -251,17 +296,15 @@ class DRVIModule(VAE):
         size_factor: torch.Tensor | None = None,
         y: torch.Tensor | None = None,
         transform_batch: torch.Tensor | None = None,
+        **kwargs,
     ) -> dict[str, Distribution | torch.Tensor | None]:
         """Run the generative process via the additive decoder.
 
         Mirrors :meth:`scvi.module.VAE.generative` but passes continuous covariates to the decoder
         separately (so the split transformation only sees the latent dimensions). With the
         embedding batch representation, the learned batch embedding is injected into each split as
-        an extra continuous covariate.
+        an extra continuous covariate. Any extra ``**kwargs`` are handed to the decoder.
         """
-        categorical_input = torch.split(cat_covs, 1, dim=1) if cat_covs is not None else ()
-        if transform_batch is not None:
-            batch_index = torch.ones_like(batch_index) * transform_batch
         if not self.use_size_factor_key:
             size_factor = library
         elif size_factor is None:
@@ -271,17 +314,9 @@ class DRVIModule(VAE):
                 "size_factor_key and that the tensor dictionary includes it."
             )
 
-        # batch handling: one-hot batch is injected via the decoder's n_cat_list; the embedding
-        # batch representation is concatenated to each split as a continuous covariate.
-        if self.batch_representation == "embedding":
-            batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
-            decoder_cont = (
-                batch_rep if cont_covs is None else torch.cat([cont_covs, batch_rep], dim=-1)
-            )
-            decoder_cats = categorical_input
-        else:
-            decoder_cont = cont_covs
-            decoder_cats = (batch_index, *categorical_input)
+        batch_index, decoder_cont, decoder_cats = self._prepare_decoder_covariate_inputs(
+            batch_index, cont_covs, cat_covs, transform_batch
+        )
 
         self.decoder.inspect_mode = self.inspect_mode
         # the decoder returns log-space per-gene parameters. Labels are not part of the decoder's
@@ -291,45 +326,13 @@ class DRVIModule(VAE):
             z,
             *decoder_cats,
             cont=decoder_cont,
+            **kwargs,
         )
-        # log_softmax over genes, then add the (log) library size to get log(mu)
-        px_scale_log = px_scale_logit - torch.logsumexp(px_scale_logit, dim=-1, keepdim=True)
-        px_rate_log = size_factor + px_scale_log  # size_factor == log(library size)
+        px_r_logit = self._compute_px_r_logit(px_r_logit, y, batch_index, **kwargs)
 
-        # dispersion logit, before exponentiation: log-theta for the (log-)NB likelihoods and
-        # log-variance for the normal likelihoods.
-        if self.dispersion == "gene-label":
-            px_r_logit = linear(one_hot(y.squeeze(-1), self.n_labels).float(), self.px_r)
-        elif self.dispersion == "gene-batch":
-            px_r_logit = linear(one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
-        elif self.dispersion == "gene":
-            px_r_logit = self.px_r
-
-        if self.gene_likelihood == "pnb":
-            px = LogNegativeBinomial(log_m=px_rate_log, log_r=px_r_logit, log_scale=px_scale_log)
-        elif self.gene_likelihood in ("nb", "zinb", "poisson"):
-            px_scale = torch.exp(px_scale_log)
-            px_rate = torch.exp(px_rate_log)
-            if self.gene_likelihood == "nb":
-                px = NegativeBinomial(mu=px_rate, theta=torch.exp(px_r_logit), scale=px_scale)
-            elif self.gene_likelihood == "zinb":
-                px = ZeroInflatedNegativeBinomial(
-                    mu=px_rate,
-                    theta=torch.exp(px_r_logit),
-                    zi_logits=px_dropout_logit,
-                    scale=px_scale,
-                )
-            else:  # poisson
-                px = Poisson(rate=px_rate, scale=px_scale)
-        elif self.gene_likelihood == "normal":
-            # Gaussian with the mean modeled directly (the raw log-space decoder output, no
-            # library/softmax) and per-gene variance modeled in log space.
-            var = torch.nan_to_num(torch.exp(px_r_logit), posinf=100.0, neginf=0.0) + 1e-8
-            px = Normal(px_scale_logit, var.sqrt(), normal_mu=px_scale_logit)
-        elif self.gene_likelihood == "normal_unit_var":
-            px = Normal(px_scale_logit, torch.ones_like(px_scale_logit), normal_mu=px_scale_logit)
-        else:
-            raise ValueError(f"Unknown gene_likelihood: {self.gene_likelihood}")
+        px = self._build_gene_likelihood(
+            self.gene_likelihood, px_scale_logit, px_r_logit, px_dropout_logit, size_factor
+        )
 
         if self.use_observed_lib_size:
             pl = None
