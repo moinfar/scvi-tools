@@ -75,7 +75,7 @@ def get_direct_effect_of_latent_splits(
         log_mean_params = torch.cat(
             [
                 unaggregated_params,
-                log_add_to_counts.reshape(-1, 1, 1).expand(-1, -1, unaggregated_params.shape[-1]),
+                log_add_to_counts[:, None, None].expand_as(unaggregated_params[:, :1]),
             ],
             dim=-2,
         )  # n_samples x (n_splits + 1) x n_genes
@@ -533,7 +533,7 @@ class InterpretabilityMixin:
             effect_tensors = []
             for gen_output in self.iterate_on_decoded_latent_samples(
                 z=span_values,
-                lib=np.ones(n_steps) * 1e4,
+                lib=np.full(n_steps, 1e4),
                 batch_values=np.full(n_steps, batch_val),
                 cat_values=np.array([cat_vals] * n_steps) if cat_vals else None,
                 cont_values=None,
