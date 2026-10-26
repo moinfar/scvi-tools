@@ -547,6 +547,28 @@ def test_drvi_interpretability(split_method, split_aggregation, batch_representa
         assert scores.shape[0] == adata.n_vars
 
 
+@pytest.mark.parametrize("directional", [True, False])
+def test_drvi_ood_mean_aggregation(directional):
+    """With mean aggregation the OOD LFC is the factor's own range, independent of the rest."""
+    adata = mock_adata()
+    DRVI.setup_anndata(adata, batch_key="batch")
+    model = DRVI(adata, n_latent=4, split_aggregation="mean")
+    model.train(max_epochs=1, batch_size=adata.n_obs)
+    embed = AnnData(model.get_latent_representation(), obs=adata.obs.copy())
+    model.set_latent_dimension_stats(embed, adata=adata)
+
+    scores, scores_more_counts = (
+        model.get_effect_of_splits_out_of_distribution(
+            embed, n_steps=4, n_samples=2, directional=directional, add_to_counts=add_to_counts
+        )
+        for add_to_counts in (1.0, 100.0)
+    )
+    assert (scores["max_possible"] >= 0).all()
+    np.testing.assert_allclose(scores["min_possible"], scores["max_possible"])
+    for key in scores:
+        np.testing.assert_allclose(scores[key], scores_more_counts[key])
+
+
 @pytest.mark.parametrize("split_aggregation", ["logsumexp", "mean"])
 def test_drvi_interpretability_split_smaller_than_latent(split_aggregation):
     """Non-directional IND interpretability works when splits group several latent dims.

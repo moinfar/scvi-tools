@@ -460,11 +460,11 @@ class InterpretabilityMixin:
         """Out-of-distribution per-split, per-gene effect scores via latent traversal.
 
         Leverages DRVI's additive decoder: each latent factor ``Z_i`` is decoded by its own
-        subnetwork ``f_i``, and the per-gene effects are aggregated over factors (``logsumexp``
-        here). The effect of perturbing ``Z_i`` on a gene therefore depends only on ``f_i``, which
-        is probed by traversing the dimension over discrete steps between its observed ``min``
-        and ``max`` (from :meth:`set_latent_dimension_stats`), averaged over randomly sampled
-        batch/covariate combinations. ``f_i``'s nonlinearity is summarized by its maximum
+        subnetwork ``f_i``, and the per-gene effects are aggregated over factors (``logsumexp`` or
+        ``mean``). The effect of perturbing ``Z_i`` on a gene therefore depends only on ``f_i``,
+        which is probed by traversing the dimension over discrete steps between its observed
+        ``min`` and ``max`` (from :meth:`set_latent_dimension_stats`), averaged over randomly
+        sampled batch/covariate combinations. ``f_i``'s nonlinearity is summarized by its maximum
         contributions over the traversal.
 
         For each factor and gene, three log-fold-change (LFC) effect scores are returned, each
@@ -479,6 +479,10 @@ class InterpretabilityMixin:
           Overall specific is a factor's effect.
         * ``combined`` -- the product ``max_possible * min_possible``; large only when the factor
           is both strong and specific.
+
+        With ``split_aggregation="mean"``, ``log(mu)`` is the mean of the splits, so the LFC is
+        ``(max f_i - min f_i) / n_splits`` whatever the other factors and ``add_to_counts``:
+        ``max_possible`` and ``min_possible`` coincide and ``combined`` is the squared LFC.
 
         ``add_to_counts`` is a pseudo-count, per ``1e6`` counts of a typical cell (the median of
         ``embed.obs["total_effect"]``), folded into LFC calculations for numerical stability. See
@@ -554,26 +558,34 @@ class InterpretabilityMixin:
                 effect_tensors.amax(dim=1) if directional else max_per_split
             )
 
-            background = min_per_split.new_tensor(log_add_to_counts)
-            # All factors at minimum
-            lse_min = torch.logaddexp(min_per_split.logsumexp(dim=0, keepdim=True), background)
-            # All factors at maximum
-            lse_max = torch.logaddexp(max_per_split.logsumexp(dim=0, keepdim=True), background)
-            # effect_max-lfc: other factors held at their minimum (lse_min)
-            max_possible = (
-                torch.log(
-                    torch.exp(lse_min)
-                    - torch.exp(min_per_split)
-                    + torch.exp(directional_max_per_split)
+            if self.module.split_aggregation == "mean":
+                # log(mu) is the mean of the splits: the LFC does not depend on other factors
+                max_possible = min_possible = (
+                    directional_max_per_split - min_per_split
+                ) / self.module.n_split_latent
+            else:
+                background = min_per_split.new_tensor(log_add_to_counts)
+                # All factors at minimum
+                lse_min = torch.logaddexp(min_per_split.logsumexp(dim=0, keepdim=True), background)
+                # All factors at maximum
+                lse_max = torch.logaddexp(max_per_split.logsumexp(dim=0, keepdim=True), background)
+                # effect_max-lfc: other factors held at their minimum (lse_min)
+                max_possible = (
+                    torch.log(
+                        torch.exp(lse_min)
+                        - torch.exp(min_per_split)
+                        + torch.exp(directional_max_per_split)
+                    )
+                    - lse_min
                 )
-                - lse_min
-            )
-            # effect_min-lfc: other factors held at their maximum (lse_max)
-            min_possible = torch.log(
-                torch.exp(lse_max)
-                - torch.exp(max_per_split)
-                + torch.exp(directional_max_per_split)
-            ) - torch.log(torch.exp(lse_max) - torch.exp(max_per_split) + torch.exp(min_per_split))
+                # effect_min-lfc: other factors held at their maximum (lse_max)
+                min_possible = torch.log(
+                    torch.exp(lse_max)
+                    - torch.exp(max_per_split)
+                    + torch.exp(directional_max_per_split)
+                ) - torch.log(
+                    torch.exp(lse_max) - torch.exp(max_per_split) + torch.exp(min_per_split)
+                )
             combined = max_possible * min_possible  # effect_combined
 
             if n_combined == 0:
