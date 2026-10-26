@@ -65,7 +65,7 @@ def get_direct_effect_of_latent_splits(
     effect
         Per-split, per-gene effect, ``(n_cells, n_splits, n_genes)``.
     total_effect_per_cell
-        Each cell's split outputs summed over splits and genes, in log space, ``(n_cells,)``.
+        Each cell's total decoder output before the softmax, in log space, ``(n_cells,)``.
     """
     if split_aggregation == "logsumexp":
         # softmax(x) == softmax(x + c); the library / -log(K) constants cancel, but the
@@ -81,8 +81,7 @@ def get_direct_effect_of_latent_splits(
         )  # n_samples x (n_splits + 1) x n_genes
         effect = -torch.log(1 - F.softmax(log_mean_params, dim=-2)[:, :-1, :])
     elif split_aggregation == "mean":
-        # the OOD scores sum exp(params) over the splits (as logsumexp does), so use that scale too
-        total_effect_per_cell = torch.logsumexp(unaggregated_params, dim=[-2, -1])
+        total_effect_per_cell = torch.logsumexp(unaggregated_params.mean(dim=-2), dim=-1)
         effect = torch.abs(unaggregated_params)
     else:
         raise NotImplementedError(
@@ -166,7 +165,7 @@ class InterpretabilityMixin:
         latent
             Posterior-mean latent for the minibatch, ``(n_cells, n_latent)``.
         total_effect_per_cell
-            Each cell's split outputs summed over splits and genes, in log space, ``(n_cells,)``.
+            Each cell's total decoder output before the softmax, in log space, ``(n_cells,)``.
         """
         if directional and self.module.n_latent != self.module.n_split_latent:
             raise NotImplementedError(
@@ -235,7 +234,7 @@ class InterpretabilityMixin:
             ``(n_splits,)`` (or ``(2, n_splits)`` if directional) when aggregating over cells, else
             ``(n_cells, n_splits)`` (or ``(n_cells, 2, n_splits)``).
         total_effect_per_cell
-            Each cell's split outputs summed over splits and genes, in log space, ``(n_cells,)``.
+            Each cell's total decoder output before the softmax, in log space, ``(n_cells,)``.
         """
         store = None if aggregate_over_cells else []
         totals = []
@@ -292,8 +291,8 @@ class InterpretabilityMixin:
         -----
         Adds the columns ``reconstruction_effect``, ``order``, ``max_value``, ``mean``, ``min``,
         ``max``, ``std``, ``std_abs``, ``title`` and ``vanished`` (+ per-direction vanished flags)
-        to ``embed.var``, and ``total_effect`` (each cell's split outputs summed over splits and
-        genes, in log space) to ``embed.obs``.
+        to ``embed.var``, and ``total_effect`` (each cell's total decoder output before the
+        softmax, in log space) to ``embed.obs``.
         """
         n_latent = self.module.n_latent
         n_split = self.module.n_split_latent
