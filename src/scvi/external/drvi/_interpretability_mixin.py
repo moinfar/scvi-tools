@@ -64,14 +64,14 @@ def get_direct_effect_of_latent_splits(
     -------
     effect
         Per-split, per-gene effect, ``(n_cells, n_splits, n_genes)``.
-    total_effect_per_cell
+    decoder_log_total
         Each cell's total decoder output before the softmax, in log space, ``(n_cells,)``.
     """
     if split_aggregation == "logsumexp":
         # softmax(x) == softmax(x + c); the library / -log(K) constants cancel, but the
         # add_to_counts offset depends on the total decoder effect (a 1e6-count cell).
-        total_effect_per_cell = torch.logsumexp(unaggregated_params, dim=[-2, -1])
-        log_add_to_counts = total_effect_per_cell + np.log(add_to_counts / 1e6)
+        decoder_log_total = torch.logsumexp(unaggregated_params, dim=[-2, -1])
+        log_add_to_counts = decoder_log_total + np.log(add_to_counts / 1e6)
         log_mean_params = torch.cat(
             [
                 unaggregated_params,
@@ -81,13 +81,13 @@ def get_direct_effect_of_latent_splits(
         )  # n_samples x (n_splits + 1) x n_genes
         effect = -torch.log(1 - F.softmax(log_mean_params, dim=-2)[:, :-1, :])
     elif split_aggregation == "mean":
-        total_effect_per_cell = torch.logsumexp(unaggregated_params.mean(dim=-2), dim=-1)
+        decoder_log_total = torch.logsumexp(unaggregated_params.mean(dim=-2), dim=-1)
         effect = torch.abs(unaggregated_params)
     else:
         raise NotImplementedError(
             "Only 'logsumexp' and 'mean' aggregations are supported for interpretability."
         )
-    return effect, total_effect_per_cell
+    return effect, decoder_log_total
 
 
 class InterpretabilityMixin:
@@ -133,7 +133,7 @@ class InterpretabilityMixin:
         directional: bool = True,
         **kwargs: Any,
     ):
-        """Yield ``(effect_tensor, latent, total_effect_per_cell)`` per minibatch.
+        """Yield ``(effect_tensor, latent, decoder_log_total)`` per minibatch.
 
         Low-level building block behind the in-distribution scores: it runs the autoencoder over
         the data and converts the per-split decoder parameters into a per-gene effect. The effect
@@ -164,7 +164,7 @@ class InterpretabilityMixin:
             ``(n_cells, 2, n_splits, n_genes)`` when ``directional``).
         latent
             Posterior-mean latent for the minibatch, ``(n_cells, n_latent)``.
-        total_effect_per_cell
+        decoder_log_total
             Each cell's total decoder output before the softmax, in log space, ``(n_cells,)``.
         """
         if directional and self.module.n_latent != self.module.n_split_latent:
@@ -180,7 +180,7 @@ class InterpretabilityMixin:
         ):
             # posterior mean, n_cells x n_latent
             latent = inference_outputs[MODULE_KEYS.QZ_KEY].loc
-            effect_tensor, total_effect_per_cell = self._get_direct_effect_of_latent_splits(
+            effect_tensor, decoder_log_total = self._get_direct_effect_of_latent_splits(
                 generative_outputs, add_to_counts
             )
 
@@ -192,7 +192,7 @@ class InterpretabilityMixin:
                     dim=1,
                 )  # n_samples x 2 x n_splits x n_genes
 
-            yield effect_tensor, latent, total_effect_per_cell
+            yield effect_tensor, latent, decoder_log_total
 
     @torch.inference_mode()
     def get_reconstruction_effect_of_each_split(
@@ -233,7 +233,7 @@ class InterpretabilityMixin:
         effect
             ``(n_splits,)`` (or ``(2, n_splits)`` if directional) when aggregating over cells, else
             ``(n_cells, n_splits)`` (or ``(n_cells, 2, n_splits)``).
-        total_effect_per_cell
+        decoder_log_total
             Each cell's total decoder output before the softmax, in log space, ``(n_cells,)``.
         """
         store = None if aggregate_over_cells else []
@@ -291,7 +291,7 @@ class InterpretabilityMixin:
         -----
         Adds the columns ``reconstruction_effect``, ``order``, ``max_value``, ``mean``, ``min``,
         ``max``, ``std``, ``std_abs``, ``title`` and ``vanished`` (+ per-direction vanished flags)
-        to ``embed.var``, and ``total_effect`` (each cell's total decoder output before the
+        to ``embed.var``, and ``_decoder_log_total`` (each cell's total decoder output before the
         softmax, in log space) to ``embed.obs``.
         """
         n_latent = self.module.n_latent
@@ -301,10 +301,10 @@ class InterpretabilityMixin:
 
         # reconstruction effect is computed per split; when a split groups several latent dims
         # (n_split_latent < n_latent) broadcast each split's effect to the dims it contains.
-        recon_per_split, total_effect = self.get_reconstruction_effect_of_each_split(
+        recon_per_split, decoder_log_total = self.get_reconstruction_effect_of_each_split(
             adata=adata, dataloader=dataloader
         )
-        embed.obs["total_effect"] = total_effect
+        embed.obs["_decoder_log_total"] = decoder_log_total
         recon_per_dim = np.repeat(recon_per_split, n_latent // n_split)
         embed.var["reconstruction_effect"] = 0.0
         embed.var.loc[embed.var.sort_values("original_dim_id").index, "reconstruction_effect"] = (
@@ -485,12 +485,12 @@ class InterpretabilityMixin:
         ``max_possible`` and ``min_possible`` coincide and ``combined`` is the squared LFC.
 
         ``add_to_counts`` is a pseudo-count, per ``1e6`` counts of a typical cell (the median of
-        ``embed.obs["total_effect"]``), folded into LFC calculations for numerical stability. See
-        the DRVI paper :cite:p:`Moinfar2024` (Supplementary Note "Interpretation of Latent Factors
-        via Additive Decoder Architecture") for the full derivation.
+        ``embed.obs["_decoder_log_total"]``), folded into LFC calculations for numerical
+        stability. See the DRVI paper :cite:p:`Moinfar2024` (Supplementary Note "Interpretation of
+        Latent Factors via Additive Decoder Architecture") for the full derivation.
 
         This function requires ``embed.var`` to contain ``min`` and ``max`` and ``embed.obs`` to
-        contain ``total_effect``, as set by :meth:`set_latent_dimension_stats`.
+        contain ``_decoder_log_total``, as set by :meth:`set_latent_dimension_stats`.
 
         The batch/covariate combinations are sampled randomly. Pass ``seed`` for a reproducible
         sample; ``None`` (default) leaves the RNG untouched, so it still honors a previously set
@@ -505,12 +505,14 @@ class InterpretabilityMixin:
             raise ValueError(f"n_steps must be even, got {n_steps}.")
         dim_mins = np.minimum(embed.var["min"].values, 0.0)
         dim_maxs = np.maximum(embed.var["max"].values, 0.0)
-        if "total_effect" not in embed.obs:
+        if "_decoder_log_total" not in embed.obs:
             raise ValueError(
-                "`embed.obs` has no `total_effect`; run `set_latent_dimension_stats`."
+                "`embed.obs` has no `_decoder_log_total`; run `set_latent_dimension_stats`."
             )
         # add_to_counts pseudo-count per 1e6 counts of a typical cell, for numerical stability.
-        log_add_to_counts = np.median(embed.obs["total_effect"]) + np.log(add_to_counts / 1e6)
+        log_add_to_counts = np.median(embed.obs["_decoder_log_total"]) + np.log(
+            add_to_counts / 1e6
+        )
 
         n_cat_total = [self.summary_stats.n_batch] + self._get_n_cats_per_cov()
         all_cat_combinations = np.asarray(
