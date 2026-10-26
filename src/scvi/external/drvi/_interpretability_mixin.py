@@ -554,15 +554,11 @@ class InterpretabilityMixin:
                 effect_tensors.amax(dim=1) if directional else max_per_split
             )
 
-            add_min = add_max = torch.full_like(min_per_split[:1], log_add_to_counts)
-            # All factors at maximum
-            lse_min = torch.logsumexp(
-                torch.cat([min_per_split, add_min], dim=0), dim=0, keepdim=True
-            )
+            background = min_per_split.new_tensor(log_add_to_counts)
             # All factors at minimum
-            lse_max = torch.logsumexp(
-                torch.cat([max_per_split, add_max], dim=0), dim=0, keepdim=True
-            )
+            lse_min = torch.logaddexp(min_per_split.logsumexp(dim=0, keepdim=True), background)
+            # All factors at maximum
+            lse_max = torch.logaddexp(max_per_split.logsumexp(dim=0, keepdim=True), background)
             # effect_max-lfc: other factors held at their minimum (lse_min)
             max_possible = (
                 torch.log(
